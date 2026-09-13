@@ -1,0 +1,61 @@
+---
+title: Public API overview
+description: Authenticate with an API key and access the versioned Cobalt catalog API.
+---
+
+The public Cobalt catalog API is served under `/v1` and requires the configured public host. It is intended for programmatic catalog access.
+
+## Create an API key
+
+Sign in as a Cobalt user and create a key. The full secret is returned only in the creation response.
+
+```bash
+curl -X POST https://api.cobaltlauncher.com/v1/auth/keys \
+  -H 'Authorization: Bearer USER_ACCESS_TOKEN' \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"catalog integration"}'
+```
+
+```json
+{
+  "key": "cbl_…",
+  "name": "catalog integration",
+  "created_at": "2026-09-13T00:00:00Z"
+}
+```
+
+Store this key like a password. A user can have up to 10 active keys. List existing keys with `GET /v1/auth/keys` and revoke one with `DELETE /v1/auth/keys/{key}`.
+
+## Authenticate catalog requests
+
+Send an API key as a bearer token.
+
+```bash
+curl 'https://api.cobaltlauncher.com/v1/games?limit=20' \
+  -H 'Authorization: Bearer cbl_YOUR_API_KEY'
+```
+
+## Catalog endpoints
+
+| Method | Path | Authentication | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/v1/stores` | None | List known game stores. |
+| `GET` | `/v1/games` | API key | List catalog games with filtering and cursor pagination. |
+| `GET` | `/v1/games/search` | API key | Search catalog games. |
+| `POST` | `/v1/games/bulk` | API key | Look up several games in one request. |
+| `GET` | `/v1/games/{id}` | API key | Get one game by ID, slug, or normalized lookup key. |
+| `GET` | `/v1/games/{id}/stats` | API key | Get catalog statistics for a game. |
+| `GET` | `/v1/games/{id}/prices` | API key | Get known price data for a game. |
+
+List and search requests accept `limit` from 1 to 100. Continue a list with the `next_cursor` returned in the response instead of relying on offset pagination.
+
+## Not yet available
+
+The following routes are registered for future data sources and currently return `501`:
+
+- `/v1/games/{id}/achievements`
+- `/v1/games/{id}/reviews`
+- `/v1/games/{id}/news`
+- `/v1/games/{id}/patches`
+
+Do not build a production workflow that depends on these routes until their backing data source is configured.

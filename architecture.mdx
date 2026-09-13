@@ -1,0 +1,54 @@
+---
+title: Architecture
+description: Understand Cobalt Backend's service boundaries and runtime lifecycle.
+---
+
+## Runtime model
+
+The server composes feature modules into one HTTP router. A module contributes routes and declares the authorization required for each route. The router applies common request IDs, recovery, CORS, compression, logging, concurrency limits, rate limits, and host checks.
+
+```text
+Clients
+  → HTTP router and middleware
+  → feature modules
+  → platform store / identity / metadata / object storage
+  → PostgreSQL or TessalDB and optional external providers
+```
+
+## Feature modules
+
+| Module | Responsibility |
+| --- | --- |
+| `auth` | Accounts, profiles, browser sign-in flows, sessions, consent, and Minecraft account linking. |
+| `social` | Friends, presence, encrypted-key publication, messages, invitations, linked Discord and itch.io identities, and WebSockets. |
+| `catalog` | Game lookup, catalog indexing, artwork, and Game Pass synchronization. |
+| `discovery` | Featured games, trends, releases, sales, collections, search, and personalization. |
+| `saves` | Cloud-save archives and save synchronization settings. |
+| `playtime` | Idempotent playtime synchronization and totals. |
+| `admin` | Administrative account, catalog, artwork, and discovery controls. |
+| `public` | Host-restricted `/v1` catalog API and API-key management. |
+
+Set `COBALT_MODULES` or `modules` in the runtime configuration to control which modules load. Health endpoints and configured plugins remain available when no feature modules are enabled.
+
+## Providers and storage
+
+The runtime keeps provider-specific code behind interfaces. This makes service behavior testable and allows an embedded build to supply a different implementation.
+
+- **Identity:** Supabase Auth or Firebase.
+- **Database:** PostgreSQL or TessalDB over its PostgreSQL-wire endpoint.
+- **Object storage:** Cloudflare R2-compatible S3 storage for saves and artwork.
+- **Metadata:** IGDB for catalog information, SteamGridDB for artwork, and IsThereAnyDeal for prices.
+
+Missing optional providers do not prevent startup. A route or job that needs an unavailable provider returns a configuration error or does no work.
+
+## Background work
+
+The catalog indexer, artwork processor, discovery refresher, and price refresher run once at startup and then at their configured intervals. A job does not overlap with another invocation in the same process.
+
+Run one production instance unless you have deliberately designed shared coordination for realtime connections and scheduled jobs.
+
+## Request behavior
+
+JSON request bodies are limited to 1 MiB. Save archives are limited to 100 MiB, avatars to 5 MiB, banners to 8 MiB, and source artwork to 16 MiB.
+
+Errors use a JSON body with an `error` field. The service returns `400` for invalid input, `401` or `403` for authorization failures, `404` for missing records, `409` for conflicts, and `5xx` for service failures. An overloaded request queue receives `503` with `Retry-After: 1`.
