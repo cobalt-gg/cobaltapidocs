@@ -1,0 +1,157 @@
+---
+title: Authentication and sessions
+description: Password sign-in, confirmation codes, token refresh, password and email changes, and device sessions.
+---
+
+All routes in this page use the application origin. Public routes do not need a bearer token; user routes require `Authorization: Bearer idToken`. The auth module shares a configurable rate limit, defaulting to 60 requests/minute per client address.
+
+## Session response
+
+Successful sign-in, immediate sign-up, verified email, browser claim, and OAuth completion return this shape:
+
+```json
+{
+  "uid": "user-id",
+  "email": "player@example.com",
+  "idToken": "ACCESS_TOKEN",
+  "refreshToken": "REFRESH_TOKEN",
+  "expiresIn": "3600",
+  "profile": {
+    "uid": "user-id",
+    "displayName": "Player",
+    "username": "player"
+  }
+}
+```
+
+The profile shown is abbreviated; use the complete [Profile contract](/profiles). `expiresIn` is an expiry duration in seconds, normally a string. Portal adoption can return `null` for email and expiry and an empty refresh token. Do not invent a fixed expiry when the field is missing.
+
+Adopt tokens only when `idToken` is present. Keep rotated refresh tokens; do not keep reusing the original.
+
+## GET /auth/policy
+
+**Public.** No input. Returns the configured client-facing capabilities and validation rules:
+
+```json
+{
+  "minimumLength": 8,
+  "maximumLength": 128,
+  "requires": ["lowercase", "uppercase", "digit", "symbol"],
+  "leakedPasswordCheck": false,
+  "emailConfirmation": true,
+  "secureEmailChange": true,
+  "requireCurrentPassword": true,
+  "otpLength": 8,
+  "otpExpirySeconds": 3600,
+  "providers": ["discord"],
+  "passkeys": true,
+  "discordClientId": "APPLICATION_ID",
+  "itchClientId": "",
+  "portalUrl": "https://id.cobaltlauncher.com",
+  "profileUrl": "https://id.cobaltlauncher.com/public"
+}
+```
+
+Values above illustrate the configured defaults. Read this endpoint instead of hardcoding buttons, return URLs, or password rules. `requires` can also contain `letter`; it can be empty. Capability flags reflect configuration and provider adapter support, not a live provider-health test. Firebase does not implement the browser OAuth, passkey, emailed-code, or consent capabilities described here.
+
+## POST /auth/sign-in
+
+**Public.** JSON: `{email: string, password: string}`. Both must be nonempty; password has a 128-byte maximum. Returns `200 Session`.
+
+The server verifies the identity, creates a placeholder Cobalt profile when needed, and records a device session on a best-effort basis. A new placeholder username is `user_` plus a random suffix; display name derives from the email prefix, with `Player` as fallback.
+
+Invalid credentials produce provider-dependent errors. Banned profiles produce `403 ACCOUNT_BANNED`.
+
+## POST /auth/sign-up
+
+**Public.** Required JSON fields:
+
+| Field | Validation |
+| --- | --- |
+| `email` | Plain valid email address; maximum 320 bytes. |
+| `password` | 8–128 bytes plus provider policy. |
+| `displayName` | Trimmed, 1–64 Unicode code points. |
+| `username` | Trimmed and lowercased; matches `^[a-z0-9_]{3,24}$`. |
+
+Username conflicts detected before registration return `409 USERNAME_TAKEN`.
+
+With an immediate provider session, returns `201 Session` and stores the requested profile. With email confirmation enabled, returns:
+
+```json
+{
+  "confirmationRequired": true,
+  "message": "Check your email, then sign in to finish creating your profile."
+}
+```
+
+This second response is `202` and has no tokens. The server does not create the profile or retain its requested username/display name in this branch. Keep those values in the client and patch the verified profile later.
+
+## POST /auth/refresh
+
+**Public.** JSON: `{refreshToken: string}`, nonempty. Returns:
+
+```json
+{"idToken":"NEW_ACCESS_TOKEN","refreshToken":"NEW_REFRESH_TOKEN","expiresIn":"3600"}
+```
+
+It does not return a profile, email, or UID. Merge the credentials into the existing session. A refresh token belonging only to revoked session records returns `401 SESSION_REVOKED`. Token rotation also updates tracked device state; tracking is best effort.
+
+## POST /auth/forgot-password
+
+**Public.** JSON: `{email: string}`, valid email. Requests provider recovery email and returns `{"success":true}`. Provider errors below 500 are deliberately suppressed, so this response does not confirm account existence or delivery.
+
+## POST /auth/verify-code
+
+**Public; requires emailed-code capability.** Send either:
+
+```json
+{"email":"player@example.com","code":"12345678","type":"signup"}
+```
+
+or:
+
+```json
+{"tokenHash":"HASH_FROM_EMAIL_LINK","type":"signup"}
+```
+
+`tokenHash` takes precedence when nonempty and has a 256-byte maximum. Otherwise email must parse, and the trimmed code must contain 1–64 bytes. Default `type` is `signup`; Supabase accepts `signup, email, email_change, recovery, magiclink`.
+
+Returns `200 Session` after completed verification. For the first part of a secure email change, returns `202 {"pending":true,"email":"...","newEmail":"..."}` without tokens. Collect the other code and retain the current session until verification finishes.
+
+## POST /auth/resend-code
+
+**Public; requires emailed-code capability.** JSON: `{email: string, type?: string}`; defaults to `signup`. Supabase resend supports `signup` and `email_change`. Returns `{"success":true}`.
+
+The handler suppresses provider client errors, including unsupported resend types. Success is not proof that an email was sent. To request another recovery email, use `/auth/forgot-password`.
+
+## POST /auth/change-password
+
+**User.** JSON: `{newPassword: string, currentPassword?: string}`. New password is 8–128 bytes plus provider policy. When `requireCurrentPassword` is enabled, an empty current password is rejected before contacting the provider.
+
+Returns `{"success":true}`. The backend invalidates its verification cache for the presented token and marks all tracked sessions revoked. It does not return replacement credentials; prompt for sign-in again.
+
+**Recovery limitation:** verifying a recovery code gives you a session, but there is no dedicated reset-password endpoint that exempts recovery sessions from `requireCurrentPassword`. If that flag is enabled, `/auth/change-password` still requires the old password. Do not present a working “forgot old password” completion path based only on these two endpoints.
+
+## POST /auth/change-email
+
+**User.** JSON: `{email: string, currentPassword?: string}`. New email is trimmed, valid, and at most 320 bytes. Returns:
+
+```json
+{"confirmationRequired":true,"secureEmailChange":true,"email":"new@example.com"}
+```
+
+Status is `202`. With Supabase, the provider performs the actual change after verification; use `/auth/verify-code` with `type:"email_change"`. Secure change can require codes from both old and new addresses. Do not update locally stored email just because the first request succeeded. Current-password checks and delivery depend on provider configuration.
+
+## Device sessions
+
+All routes below require **user** auth.
+
+| Endpoint | Input | Success |
+| --- | --- | --- |
+| `GET /auth/sessions` | None | `{sessions: SessionDevice[]}`, ordered by most recent `lastSeenAt`. |
+| `DELETE /auth/sessions/{id}` | Session ID, 1–64 bytes | `{success:true}`; 404 if not an active session owned by this user. |
+| `DELETE /auth/sessions` | None | `{revoked: number}`; revokes all tracked sessions except records matching the presented access token. |
+
+`SessionDevice` fields: `id, client, device, ip, createdAt, lastSeenAt, current`. Times are timestamp strings; `current` is boolean. Token hashes and refresh credentials are never returned. Session labels derive from User-Agent; they are display text, not stable identifiers.
+
+Revocation is checked at the refresh boundary. Already issued access tokens are not rejected by these session records on each request, and established sockets are not closed. Do not promise immediate remote-device termination or a hardcoded one-hour bound. Expiry depends on the identity provider.

@@ -1,0 +1,91 @@
+---
+title: Cloud saves
+description: Raw archive transfer, save metadata, settings inheritance, and client-owned conflict handling.
+---
+
+All routes require **user** auth and operate on that user's saves. The server keeps one current archive per game ID. Game ID is an app-supplied identifier, not an automatic catalog lookup.
+
+## Save metadata
+
+```json
+{
+  "gameId": "game-id",
+  "gameName": "Example game",
+  "emulator": "ryujinx",
+  "deviceName": "Desktop",
+  "saveSize": 4096,
+  "cloudModifiedAt": "2026-09-13T12:00:00Z",
+  "createdAt": "2026-09-13T12:00:00Z"
+}
+```
+
+| Endpoint | Output |
+| --- | --- |
+| `GET /saves` | `{saves:SaveMetadata[]}`, ordered by cloud modification time descending; no pagination. |
+| `GET /saves/{gameId}` | One SaveMetadata, or 404. |
+| `DELETE /saves/{gameId}` | `{success:true}`, including when absent. |
+
+Deletion removes metadata and then attempts object cleanup. A cleanup failure is logged; it does not reverse successful metadata deletion.
+
+## POST /saves/{gameId}/upload
+
+Send the raw archive body with `Content-Type: application/zip`. The backend stores the bytes as a ZIP object; it does not unpack the archive or verify ZIP structure.
+
+Game ID must contain 1–128 bytes. Archive must be nonempty and at most 100 MiB.
+
+| Optional header | Behavior |
+| --- | --- |
+| `X-Game-Name` | Game name, maximum 1,024 bytes; defaults to empty string. |
+| `X-Device-Name` | Device label, maximum 256 bytes; defaults to empty string. |
+| `X-Emulator` | Maximum 64 bytes; defaults to `ryujinx`. |
+| `X-Local-Modified-At` | RFC3339 timestamp; defaults to the server's current time. |
+
+```bash
+curl -X POST 'https://app-api.cobaltlauncher.com/saves/game-id/upload' \
+  -H 'Authorization: Bearer ID_TOKEN' \
+  -H 'Content-Type: application/zip' \
+  -H 'X-Game-Name: Example game' \
+  -H 'X-Device-Name: Desktop' \
+  -H 'X-Local-Modified-At: 2026-09-13T12:00:00Z' \
+  --data-binary @save.zip
+```
+
+Returns `201 SaveMetadata` for both creation and replacement. Missing storage returns 503; too much data returns 413; empty bytes, invalid timestamps, or metadata lengths return 400.
+
+The upload first writes a uniquely named object, then switches the metadata to it and attempts to remove the previous object. The old metadata is not replaced if the new object write fails.
+
+There is no optimistic concurrency check. The last successful metadata update wins even if its local timestamp is older. A timeout can occur after a successful overwrite; read the metadata before retrying.
+
+## GET /saves/{gameId}/download
+
+Returns raw `application/zip`, with `Content-Disposition: attachment`, `Content-Length`, and `Cache-Control: private, no-store`.
+
+Metadata headers: `X-Cloud-Modified-At`, `X-Game-Name`, `X-Emulator`, and `X-Save-Size`. These four are explicitly exposed for browser responses. Check HTTP status before treating a response as ZIP; an error can be JSON. A missing save is 404 and missing storage is 503.
+
+Cross-origin upload requests with the custom metadata headers are not supported by the backend's current CORS allowlist. See [Request conventions](/architecture).
+
+## Settings
+
+Settings are preferences consumed by the app; upload/download handlers do not enforce them.
+
+```json
+{"enabled":true,"conflictMode":"ask","autoUpload":true}
+```
+
+Those are the defaults. `conflictMode` must be `ask`, `prefer_cloud`, or `prefer_local`.
+
+| Endpoint | Input/output |
+| --- | --- |
+| `GET /settings` | Returns global Settings or defaults. |
+| `PUT /settings` | JSON Settings; returns saved global Settings. |
+| `GET /settings/{gameId}` | Returns effective Settings plus `hasOverride:boolean`. |
+| `PUT /settings/{gameId}` | JSON Settings; returns Settings plus `hasOverride:true`. |
+| `DELETE /settings/{gameId}` | Returns `{success:true,reverted:true}`; subsequent reads inherit global settings. |
+
+PUT starts from the built-in defaults and applies supplied fields. It does not merge with existing settings or the global value. Send all three fields when preserving a user's choices. A game override replaces all three global preferences.
+
+The internal reserved key `__global__` cannot be used in a game PUT or DELETE. An empty/whitespace-only game key is rejected on PUT. Reading preferences does not create a cloud archive.
+
+## Client conflict flow
+
+Read effective settings, check local/cloud timestamps, and decide before upload. When settings say `ask`, present both versions. For a cloud choice, download and replace the local archive only after the entire response is received. For a local choice, upload and store returned metadata. There is no remote version history or automatic conflict merge.

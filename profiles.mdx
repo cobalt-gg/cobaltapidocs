@@ -1,0 +1,104 @@
+---
+title: Profiles
+description: Profile fields, partial updates, uploads, authenticated profile views, and public share pages.
+---
+
+## Profile object
+
+`GET /auth/profile` requires **user** auth and returns the profile object directly:
+
+```json
+{
+  "uid": "user-id",
+  "displayName": "Player",
+  "username": "player",
+  "avatarUrl": null,
+  "bannerUrl": null,
+  "bio": "",
+  "flairs": [],
+  "showcaseGames": [],
+  "showcaseBlocks": [],
+  "recentGames": [],
+  "createdAt": "2026-09-13T12:00:00Z",
+  "isAdmin": false,
+  "isBanned": false,
+  "discordId": null,
+  "discordUsername": null,
+  "discordAvatar": null,
+  "itchId": null,
+  "itchUsername": null,
+  "itchUrl": null
+}
+```
+
+Optional stored text can be null. `flairs, showcaseGames, recentGames` normalize missing values to arrays; `showcaseBlocks` is decoded from stored JSON and can be null. Email and tokens are not profile fields. `username` is the Cobalt Tag; `uid` is the stable account identifier.
+
+## PATCH /auth/profile
+
+**User.** Send only the fields you want to replace. Returns the complete updated profile.
+
+| Writable field | Validation and behavior |
+| --- | --- |
+| `displayName` | Trimmed string, 1–64 Unicode code points. |
+| `username` | Lowercased string matching `^[a-z0-9_]{3,24}$`; unlike sign-up, whitespace is not trimmed. |
+| `bio` | String, at most 300 Unicode code points; `""` clears it. |
+| `showcaseGames` | Array of objects, at most 6. |
+| `recentGames` | Array of objects, at most 3. |
+| `showcaseBlocks` | Array of objects, at most 20. |
+
+Each supplied array's serialized JSON must be at most 65,536 bytes. Item internals are not validated as a fixed schema; the UI's conventional game shape is `{id, name, coverUrl}`. Arrays replace the stored collection; they are not appended or merged.
+
+Omitted or null fields are ignored. Use an empty array to clear a collection. Supplying no recognized non-null fields returns `400 nothing to update`. Unknown fields are ignored in this handler. Duplicate usernames can return the shared `409 conflict`, so do not depend only on sign-up's `USERNAME_TAKEN` text.
+
+```json
+{
+  "displayName": "Avery",
+  "bio": "Currently playing.",
+  "showcaseGames": [{"id":"cobalt-game-id","name":"Example game","coverUrl":"https://cdn.cobaltlauncher.com/example.webp"}]
+}
+```
+
+Avatar URLs, linked identities, flags, and flairs are not writable through this route.
+
+## Image uploads
+
+**User.** Send raw JPEG, PNG, GIF, or WebP bytes, not multipart form data. The backend detects the actual content type.
+
+| Endpoint | Maximum | Success |
+| --- | --- | --- |
+| `POST /auth/avatar` | 5 MiB | `{avatarUrl: string}` |
+| `POST /auth/banner` | 8 MiB | `{bannerUrl: string}` |
+
+Both return `200`, update the profile URL, and create a new unique object URL. Empty input returns 400, oversize returns 413, unsupported content returns 415, and unavailable storage returns 503. Replacing an image does not delete the previous uploaded object in this handler. There is no separate image-delete route.
+
+## GET /profile/{uid}
+
+**User.** This is an authenticated JSON profile view, even for someone else's profile. The path takes a UID, not a username.
+
+```text
+{
+  profile: Profile,
+  presence: {status: string, game: string|null, game_id: string|null},
+  friendshipStatus: "none"|"friends"|"pending_incoming"|"pending_outgoing",
+  friends: [{uid, displayName, username, avatarUrl}],
+  friendCount: number,
+  gameCount: null,
+  isSelf: boolean
+}
+```
+
+The preview contains at most 12 accepted friends, sorted by username after selection. `friendCount` is the full accepted count. `gameCount` is always null; do not display it as a known zero. Banned target profiles return `404 user not found`.
+
+Presence is the stored status with an offline fallback; this endpoint does not expire stale presence or derive it from socket connectivity.
+
+## GET /public/{identifier}
+
+**Public.** Returns server-rendered HTML, not JSON. Accepts username or UID. Missing or banned profiles render an HTML 404. The page includes profile metadata for chat previews, banner/avatar, bio, flairs, showcase games, membership date, and friend count. Its canonical URL uses the current username.
+
+Use `profileUrl` from `GET /auth/policy` to build share links. The default portal URL requires routing/proxying `/public` to the backend. Successful public pages cache for 300 seconds, so profile changes need not appear immediately in an existing unfurl.
+
+## DELETE /auth/profile
+
+**User.** No body. Deletes the identity-provider account first, then the Cobalt user record; returns `{"success":true}`. Clear local credentials and cached private data on success.
+
+Provider deletion and database deletion are not atomic. A failure is not proof that neither step occurred. This route does not explicitly clean up uploaded objects. It differs from administrative user deletion, which deletes the Cobalt record only.

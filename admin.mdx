@@ -1,0 +1,140 @@
+---
+title: Administration
+description: Exact contracts for Cobalt moderation, catalog editing, artwork management, and featured content.
+---
+
+All `/admin` routes require **admin** auth: a user bearer token whose Cobalt profile has `isAdmin:true` and is not banned. An API key does not grant administration.
+
+## Users
+
+### GET /admin/users
+
+Query `q?` matches username/display name (maximum 128 bytes); `limit` defaults to 50, range 1–200; `offset` defaults to 0, range 0–100,000.
+
+Returns `{users,total,limit,offset}`, newest accounts first. User rows contain `uid,displayName,username,avatarUrl,isAdmin,isBanned,createdAt,flairs`. Flairs are decoded strings; stored null can remain null here.
+
+### POST /admin/users/{uid}/{action}
+
+No body. Supported actions: `ban, unban, make-admin, revoke-admin`. Returns the full updated [Profile](/profiles). Missing target is 404. Unknown action is 400. You cannot ban yourself or revoke your own admin role through this route.
+
+The action updates Cobalt's role/ban fields, not the identity provider's account state. HTTP authorization checks those fields on subsequent requests. Do not assume the action immediately closes existing sockets.
+
+### POST /admin/users/{uid}/flairs
+
+JSON: `{flairs:string[]}`. Allowed values are `admin, mod, dev, est_2026, early_backer, beta_tester, verified`. Duplicates are removed; an empty list clears flairs. Returns the full Profile.
+
+Flairs are presentation labels and are separate from `isAdmin`. Giving an `admin` flair does not grant administrative access.
+
+### DELETE /admin/users/{uid}
+
+No body. Returns `{success:true}`; missing target is 404. Deleting yourself here is rejected with 400.
+
+This deletes the Cobalt user record only. It does not delete the identity-provider account or uploaded objects. A later valid sign-in can create another placeholder profile. For user-initiated account deletion, use `DELETE /auth/profile`.
+
+## Catalog management
+
+### GET /admin/games
+
+Query `q?` matches game name; `limit` default 50/max 200; `offset` default 0/max 100,000. Returns `{games:Game[],total,limit,offset}` sorted by game name. Game is the [internal catalog shape](/catalog).
+
+### PATCH /admin/games/{id}
+
+Use the canonical game ID. Accepts a nonempty partial JSON object with these fields only:
+
+| Field | Validation |
+| --- | --- |
+| `gameName,slug,publisher,developer,description` | String or null, at most 65,536 bytes. Non-null gameName cannot be blank. Database constraints can further reject null. |
+| `releaseYear` | Integer, 0–100,000. |
+| `rating` | Integer, 0–100. |
+| `price` | Nonnegative JSON number. |
+| `platforms,genres` | String arrays, at most 100 items; nullable input can be stored. |
+
+Unknown fields return `400 unknown field: FIELD`. Returns the updated Game. This updates its modification timestamp and adds normalized name/slug lookup aliases. It does not regenerate the game ID or remove older aliases.
+
+### DELETE /admin/games/{id}
+
+Canonical game ID; no body. Returns `{success:true}`, or 404 if absent. Deletes the catalog row. This handler does not explicitly delete stored artwork files, so do not promise complete object cleanup.
+
+### POST /admin/games/{id}/reindex
+
+No body. Resolves the existing game, performs a synchronous provider search by its name, saves the refreshed record, and returns Game. Missing provider is 503. It can replace edited metadata and queue artwork. This is not an asynchronous job acknowledgement.
+
+## Artwork management
+
+| Endpoint | Input | Success |
+| --- | --- | --- |
+| `PUT /admin/games/{id}/art/{type}` | Raw image bytes, at most 16 MiB | `{success:true}` after original and four WebP variants are written. |
+| `DELETE /admin/games/{id}/art/{type}` | No body | `{success:true}` after all four variants and original are removed. |
+| `GET /admin/art-queue` | Optional `status`; `limit` default 200/max 1,000 | `{summary,entries}`. |
+
+Types are `portrait,landscape,hero,logo,icon`. Use canonical game IDs for artwork writes; object keys are built from the literal path ID even though upload existence checking can resolve a name/slug.
+
+Upload detects image content, returns 415 for non-images, and requires conversion support and configured storage. It writes each size sequentially without rollback across storage and database; an error can leave partially updated variants.
+
+Queue entry fields: `gameId,status,retries,requestedTypes,nextAttempt,lastError`. Summary is a map of status to count across the entire queue, independent of the selected filter. Entries are ordered by next attempt descending. Status values include `queued,processing,cached,failed`. Worker retries stop after six failed attempts, although another queue request can reset a failed item.
+
+Artwork is cached under stable URLs. Refreshing your admin data does not itself evict a cached image.
+
+## Featured content
+
+### GET /admin/discover/featured
+
+No input. Returns `{count,entries}`, up to 1,000 records ordered by section then priority.
+
+Entry fields: `id,gameId,name,section,priority,pinned,badge,blurb,genres,rating,releaseYear,slug,expiresAt,refreshKey`. This includes expired entries. Genres retain the stored value rather than being decoded to an array.
+
+### POST /admin/discover/featured
+
+```json
+{"gameId":"game-id","section":"spotlight","priority":1,"badge":"Featured","blurb":"Try this game","expiresAt":null}
+```
+
+`gameId` and nonempty `section` are required; section is at most 64 bytes. Priority defaults to zero. Badge/blurb are optional nullable strings; expiry is an optional nullable RFC3339 timestamp.
+
+Returns `201 {id:number,ok:true}`. Each request creates a new numeric featured ID, copies catalog metadata, and sets `pinned:true` and `refreshKey:"manual"`. Use the featured ID for subsequent changes, not game ID. Creation is not idempotent.
+
+Use one of the [recognized section IDs](/discovery). The server accepts other nonempty section strings, but `/featured` will not display them.
+
+### PATCH /admin/discover/featured/{id}
+
+Positive 32-bit integer ID. Nonempty partial JSON object accepts only:
+
+- `section`: nonblank string (or null subject to database constraints), at most 65,536 bytes.
+- `priority`: integer 0–100,000.
+- `badge,blurb`: string at most 65,536 bytes or null.
+- `expiresAt`: RFC3339 timestamp or null.
+- `pinned`: boolean.
+
+Returns `{ok:true}`; missing ID is 404. These patch validations differ from create; do not assume identical limits. Pinning preserves an item through automatic featured refresh.
+
+### DELETE /admin/discover/featured/{id}
+
+Positive 32-bit integer ID; returns `{ok:true}`, or 404 if absent.
+
+## Game Pass ingestion
+
+These catalog routes use **bypass** auth, not admin/user auth. They are intended for trusted synchronization tools. Do not embed the bypass secret into the distributed app.
+
+### POST /games/sync/gamepass/prefetch
+
+No body. Reads Microsoft catalogs for ultimate, PC, and standard, deduplicates product IDs, and returns `{catalog:[{productId,title,tier,categories,imageUrl}],count}`. This fetch does not write the Game Pass table.
+
+### POST /games/sync/gamepass
+
+JSON:
+
+```json
+{
+  "entries": [
+    ["PRODUCT_ID", {"title":"Example game","tiers":"ultimate,pc","imageUrl":"https://example.com/cover.png"}]
+  ],
+  "total": 1,
+  "offset": 0
+}
+```
+
+Supply 1–50 entries and nonnegative total/offset. Each entry is a two-element array, not the prefetch object's shape. Convert prefetch `productId` and `tier` to this tuple format.
+
+The first comma-separated tier is used; empty defaults to ultimate. Games are resolved or indexed by title when possible, and unmatched products can be stored with null game ID. Bad entries count as failed without necessarily failing the batch.
+
+Returns `{done,progress:{indexed,failed,total},batch:{offset,size}}`. Done means positive total and offset plus batch length reaches it; it does not mean every entry succeeded. Progress counts are for this request. Entries are upserted individually; this is not an atomic catalog replacement and does not delete omitted products.

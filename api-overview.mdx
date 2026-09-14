@@ -1,61 +1,80 @@
 ---
-title: Public API overview
-description: Authenticate with an API key and access the versioned Cobalt catalog API.
+title: Versioned API
+description: The separate API-key catalog surface and key-management contracts used by integration screens.
 ---
 
-The public Cobalt catalog API is served under `/v1` and requires the configured public host. It is intended for programmatic catalog access.
+These routes require the configured public host, default `https://api.cobaltlauncher.com`. They are separate from the launcher's internal catalog routes. Use [Catalog and artwork](/catalog) for internal library features.
 
-## Create an API key
+## API-key management
 
-Sign in as a Cobalt user and create a key. The full secret is returned only in the creation response.
+These three routes require **user** bearer auth, not an API key.
 
-```bash
-curl -X POST https://api.cobaltlauncher.com/v1/auth/keys \
-  -H 'Authorization: Bearer USER_ACCESS_TOKEN' \
-  -H 'Content-Type: application/json' \
-  --data '{"name":"catalog integration"}'
-```
+| Endpoint | Input | Response |
+| --- | --- | --- |
+| `POST /v1/auth/keys` | JSON `{name?:string}` | `201 {key,name,created_at}` |
+| `GET /v1/auth/keys` | None | `{data:[{key,name,created_at,last_used_at}]}` |
+| `DELETE /v1/auth/keys/{key}` | Full or displayed masked key | `{ok:true}` |
 
-```json
+Name is trimmed, defaults to `Unnamed key`, and has a 128-byte maximum. At most 10 active keys per user; more gives 409. Only creation returns the full `cbl_` secret. List masks all but the first eight and last four characters, ordered newest first.
+
+Revoke accepts an unambiguous masked key. If several keys match the same mask, it returns 409 and requires the full key. An absent/already revoked key gives 404. The current authorization code does not update `last_used_at`; do not present it as reliable recent-usage telemetry.
+
+## Versioned game object
+
+```text
 {
-  "key": "cbl_…",
-  "name": "catalog integration",
-  "created_at": "2026-09-13T00:00:00Z"
+  id: string,
+  name: string,
+  slug: string|null,
+  release_year: number|null,
+  publisher: string|null,
+  developer: string|null,
+  description: string|null,
+  platforms: string[],
+  genres: string[],
+  rating: number|null
 }
 ```
 
-Store this key like a password. A user can have up to 10 active keys. List existing keys with `GET /v1/auth/keys` and revoke one with `DELETE /v1/auth/keys/{key}`.
+No `gameId,gameName,price,currentPrice,source` fields are returned in this shape.
 
-## Authenticate catalog requests
+## GET /v1/games and GET /v1/games/search
 
-Send an API key as a bearer token.
+Both require **API-key** auth via `Authorization: Bearer cbl_...` and use the same handler.
 
-```bash
-curl 'https://api.cobaltlauncher.com/v1/games?limit=20' \
-  -H 'Authorization: Bearer cbl_YOUR_API_KEY'
-```
+Query: `limit` default 20, range 1–100; optional `cursor`, `q`, `platform`, and `genre`. Each text filter is at most 128 bytes, applied with a case-insensitive substring match. All supplied filters combine. Unlike internal discovery search, an empty query lists games.
 
-## Catalog endpoints
+Returns `{data:VersionedGame[],next_cursor:string|null}`, ordered by game ID. Pass `next_cursor` as the next request's `cursor`, retaining filters. Null means no more matches. There is no total count.
 
-| Method | Path | Authentication | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/v1/stores` | None | List known game stores. |
-| `GET` | `/v1/games` | API key | List catalog games with filtering and cursor pagination. |
-| `GET` | `/v1/games/search` | API key | Search catalog games. |
-| `POST` | `/v1/games/bulk` | API key | Look up several games in one request. |
-| `GET` | `/v1/games/{id}` | API key | Get one game by ID, slug, or normalized lookup key. |
-| `GET` | `/v1/games/{id}/stats` | API key | Get catalog statistics for a game. |
-| `GET` | `/v1/games/{id}/prices` | API key | Get known price data for a game. |
+## POST /v1/games/bulk
 
-List and search requests accept `limit` from 1 to 100. Continue a list with the `next_cursor` returned in the response instead of relying on offset pagination.
+**API key.** JSON `{ids?:string[],names?:string[]}`, 1–100 combined. Returns `{data:VersionedGame[],missing:string[]}`. Same lookup/deduplication rules as internal bulk; no count field.
 
-## Not yet available
+## GET /v1/games/{id}
 
-The following routes are registered for future data sources and currently return `501`:
+**API key.** Resolves ID, slug, or normalized name/alias. Returns one VersionedGame directly or 404.
 
-- `/v1/games/{id}/achievements`
-- `/v1/games/{id}/reviews`
-- `/v1/games/{id}/news`
-- `/v1/games/{id}/patches`
+## GET /v1/games/{id}/stats
 
-Do not build a production workflow that depends on these routes until their backing data source is configured.
+**API key.** Returns `{game_id,total_players,total_playtime_seconds,total_sessions}`. Values aggregate recorded Cobalt playtime totals; “players” counts user/game total rows, not currently online players or worldwide owners.
+
+## GET /v1/games/{id}/prices
+
+**API key.** Returns `{game_id,data:[{store,price,regular,cut,expires_at}]}`. Price and regular are stored strings; values and expiry can be null. It is stored sale data, not a live multi-store pricing query.
+
+## GET /v1/stores
+
+**Public.** Returns `{data:[{id,name,url}]}`. Fixed IDs are `steam,gog,epic,xbox,playstation,nintendo`. Listing a store does not guarantee an active integration for that store.
+
+## Registered placeholders
+
+All require **API-key** auth and return `501 {"error":"this data source is not configured"}`:
+
+- `GET /v1/games/{id}/achievements`
+- `GET /v1/games/{id}/achievements/{achId}`
+- `GET /v1/games/{id}/reviews`
+- `GET /v1/games/{id}/reviews/summary`
+- `GET /v1/games/{id}/news`
+- `GET /v1/games/{id}/patches`
+
+Do not present these as working app capabilities.

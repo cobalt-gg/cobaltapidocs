@@ -1,0 +1,121 @@
+---
+title: Browser authentication
+description: OAuth, passkeys, PKCE handoffs, account linking decisions, portal adoption, and consent.
+---
+
+## Shared handoff protocol
+
+Desktop OAuth and passkeys run in a browser. The browser hands a one-time code back to the initiating client, which exchanges it for the [Session response](/authentication). The API never needs a client to hold provider secrets.
+
+1. Generate a random verifier and keep it in the initiating client/tab.
+2. Compute `challenge = base64url(SHA256(UTF8(verifier)))` with no padding.
+3. Start OAuth or a passkey ceremony and retain the returned `state`.
+4. Open `authorizationUrl` in the browser.
+5. On return, match `state` to your outstanding flow and inspect `result`.
+6. For `ready`, claim with `state, code, codeVerifier`.
+
+The challenge must be 43–128 bytes of unpadded base64url; `+`, `/`, `=`, and spaces are rejected. Start requests optionally accept `returnTo`. It must exactly equal the configured desktop deep link or portal URL. Omission selects the desktop deep link, default `cobalt://auth/callback`. Read the portal target from `/auth/policy`.
+
+Pending start states expire after 10 minutes. Ready claims expire after 2 minutes. Account-link decisions expire after 15 minutes. Keep the verifier private; only the challenge is sent at start.
+
+## POST /auth/oauth/start
+
+**Public; federated capability required.**
+
+```json
+{"provider":"discord","challenge":"BASE64URL_SHA256_VERIFIER","returnTo":"https://id.cobaltlauncher.com"}
+```
+
+Provider is trimmed and lowercased and must occur in policy `providers`. Returns `200 {authorizationUrl: string, state: string}`. Unsupported provider/return target/challenge returns 400; unsupported identity capability returns 501.
+
+## GET /auth/oauth/callback
+
+**Public browser callback.** Query: `state`, plus provider `code` or `error`. Consumes the pending OAuth state, exchanges the provider authorization, then responds with `302` to the selected return target. Query fields are `state`, `result`, and, for ready/link outcomes, `code`.
+
+| Result | Client behavior |
+| --- | --- |
+| `ready` | Claim the session. |
+| `link` | Show the portal's create-or-attach decision. |
+| `cancelled` | End the pending flow without adopting credentials. |
+| `failed` | Show a sign-in failure; restart when requested. |
+
+Invalid/expired state and some downstream failures return HTTP errors rather than a redirect. Do not assume every callback finishes with `result=failed`.
+
+A known Cobalt profile takes precedence. Otherwise a verified Discord connection can resolve to its existing owner. An unclaimed Discord identity returning to the portal produces `link`; a desktop-targeted flow normally creates a placeholder profile and finishes `ready`. Do not implement the portal-only decision as a mandatory desktop step.
+
+## POST /auth/handoff/claim
+
+**Public.** JSON: `{state: string, code: string, codeVerifier: string}`, all required. Returns `200 Session`.
+
+The claim is single-use. The ready record is consumed before verifier comparison, so an invalid proof can spend it. Retrying a consumed/expired claim returns 400. Do not run multiple claims for one return URL or blindly retry after a lost response.
+
+## OAuth account decision
+
+Both routes are **public**, authorized by the pending proof tuple `state, code, codeVerifier`.
+
+### POST /auth/oauth/pending
+
+Send the proof tuple. Returns `{provider, username, email, displayName, tag}`, with suggested profile fields. This read does not consume the pending decision.
+
+### POST /auth/oauth/complete
+
+Send the proof tuple plus a mode:
+
+| Mode | Additional input | Behavior |
+| --- | --- | --- |
+| `create` | `displayName, username, password` | Creates the profile for the verified provider identity, sets its password, and links Discord. Email comes from the provider session. |
+| `attach` | `email, password` | Verifies the existing account's password, connects Discord, and returns that account's session. |
+
+Both return `200 Session`. Create uses the sign-up username/display-name rules and an 8–128-byte password. Attach requires a parseable email and a nonempty password of at most 128 bytes.
+
+Wrong credentials or a taken username normally leave the decision available to correct. Completed flows consume it. A Discord identity owned by another account returns 409. These multi-service operations are not generally idempotent; do not replay an ambiguous completion automatically.
+
+## Passkeys
+
+### POST /auth/passkey/start
+
+**Optional user.** JSON: `{challenge, intent?, returnTo?}`. `intent:"enroll"` requires a user bearer token; all other intent values select `sign-in`.
+
+Returns `{authorizationUrl, state}`, where the URL points to the backend bridge. Policy `passkeys` must be enabled and the provider must support it, otherwise 501.
+
+### GET /auth/passkey/bridge
+
+**Public browser page.** Query `state`. Returns HTML for the pending ceremony. Open this page on its HTTPS relying-party origin; a desktop `file://` page cannot substitute for it.
+
+### POST /auth/passkey/options
+
+**Public with pending state.** JSON: `{state}`. Returns provider WebAuthn options unchanged. The supplied bridge supports `data.options || data` and `data.challenge_id || data.challengeId`. Options are not a normal Cobalt session object.
+
+### POST /auth/passkey/verify
+
+**Public with pending state.** JSON: `{state, challengeId, credential}`, where `credential` is the browser credential's JSON representation. To cancel, send `{state, cancelled:true}`.
+
+Returns `{redirectUrl}`. Follow it, then process the result:
+
+- `ready`: claim the new sign-in session.
+- `enrolled`: the credential was added; retain the existing session, with no claim.
+- `cancelled`: no credentials to adopt.
+
+The verify step consumes the pending state. A failed ceremony can require a new start. The default bridge uses a 90-second browser ceremony timeout. There are no built-in passkey listing/removal endpoints.
+
+## Account portal handoff
+
+| Endpoint | Auth | Input | Output |
+| --- | --- | --- | --- |
+| `POST /auth/portal-token` | User | Optional JSON `{refreshToken}`, or no body | `{url, expiresIn:120}` |
+| `POST /auth/portal-session` | Public | `{token}`, nonempty, at most 256 bytes | Session |
+
+A new portal link invalidates previous portal links for the user. The URL contains a one-time `token`; remove it from browser history after reading it. The adoption response reuses the parked access token and optional refresh token, not freshly minted credentials. Its `email` and `expiresIn` are null; `refreshToken` can be empty. Use normal refresh handling when necessary.
+
+## Sign in with Cobalt consent
+
+These routes serve an application asking to use Cobalt as its identity provider. They are distinct from Discord sign-in.
+
+| Endpoint | Auth | Input | Output |
+| --- | --- | --- | --- |
+| `GET /auth/consent/{id}` | User | Authorization ID | Provider authorization details, passed through. |
+| `POST /auth/consent/{id}` | User | `{action:"approve"}` or `{action:"deny"}` | Provider response containing `redirect_url`. |
+
+Supabase IDs must match `^[A-Za-z0-9_-]{1,64}$`. Unsupported provider capability returns 501. The provider binds the authorization to the signed-in user.
+
+The portal receives `authorization_id` in the URL. It reads the details and follows `redirect_url` immediately when consent already exists; otherwise it displays the client and scopes, then submits the chosen action. Current portal parsing accepts client `name` or `client_name`, `redirect_uri`, and `scope` or `scopes`. These are provider pass-through fields, not a fixed locally enforced schema.

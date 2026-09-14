@@ -1,64 +1,58 @@
 ---
-title: Run locally
-description: Start Cobalt Backend against a local database.
+title: Client workflows
+description: Request sequences for common app changes, including cache and retry behavior.
 ---
 
-Use this guide to start the server with PostgreSQL and Supabase Auth. The service requires Go 1.23 or later.
+## Restore an app session
 
-## Before you begin
+1. Load your stored access and refresh credentials.
+2. Request `GET /auth/profile` with the access token.
+3. On `401`, run one shared `POST /auth/refresh` request for concurrent callers.
+4. Store the rotated tokens and retry each failed authenticated request once.
+5. If authorization still fails, clear the local session and return to sign-in. Treat network failure separately from invalid credentials.
 
-You need:
+The existing Cobalt ID client uses local storage key `cobalt-id-session` for `uid, email, idToken, refreshToken` and rereads the profile. Its `signOut()` clears local state only. Ending a remote device session requires the sessions API.
 
-- Go 1.23 or later.
-- A PostgreSQL database. PostgreSQL 16 is a good local default.
-- A Supabase project and its project URL, publishable key, and legacy `service_role` JWT. Firebase is also supported for existing deployments.
+## Register and finish a profile
 
-## Configure the environment
+Fetch `GET /auth/policy`, then submit `POST /auth/sign-up`. If it returns `201` with tokens, adopt the session. If it returns `202 confirmationRequired`, collect the email code and use `POST /auth/verify-code`.
 
-From the backend repository, copy the example environment file and replace its placeholder values.
+Confirmation-enabled sign-up does not reserve or persist the requested profile fields. After verified sign-in, patch `/auth/profile` with the chosen display name and username; handle a username conflict then. See [Authentication](/authentication).
 
-```sh
-cp .env.example .env
-```
+## Build a profile game picker
 
-The process deliberately does not load `.env` files itself. Export the values in your shell or load them through your development environment.
+1. Call `GET /search?q=...&limit=8` without authentication for discovery results.
+2. Read `gameId` and `name`; discovery fields differ from the catalog's `gameName`.
+3. Call `POST /art/bulk` with `{"gameIds":["..."],"types":["portrait"]}`.
+4. Use cached URLs, show placeholders for queued/missing art, and poll queued entries with backoff.
+5. Save the complete replacement `showcaseGames` array using `PATCH /auth/profile`. Each item conventionally contains `id, name, coverUrl`.
 
-```sh
-export DATABASE_DIALECT=postgres
-export DATABASE_URL='postgres://cobalt:password@localhost:5432/cobalt?sslmode=disable'
-export AUTH_PROVIDER=supabase
-export SUPABASE_URL='https://YOUR_PROJECT.supabase.co'
-export SUPABASE_PUBLISHABLE_KEY='YOUR_PUBLISHABLE_KEY'
-export SUPABASE_SERVICE_ROLE_KEY='YOUR_LEGACY_SERVICE_ROLE_JWT'
-```
+## Open account management from the launcher
 
-The service-role JWT is server-only. Never put it in a desktop client, web client, or source control.
+Call authenticated `POST /auth/portal-token`, optionally including `refreshToken`. Open its `url` in the browser. The portal reads the query token, exchanges it through `POST /auth/portal-session`, and removes it from the address bar.
 
-## Validate and run
+The link expires after two minutes and can be used once. Minting a new portal link invalidates older portal links for that user. See [Browser authentication](/browser-auth).
 
-Build the server, validate the configuration, then start it.
+## Keep messages synchronized
 
-```sh
-go build -o bin/cobalt ./cmd/server
-./bin/cobalt -check-config
-./bin/cobalt
-```
+Connect the [WebSocket](/messages), reconcile through `GET /social/dm/sync`, and merge messages by `id`. Persist `nextCursor` after applying a page; continue while `hasMore` is true. Apply `message` and `message_update` events to the same local store. Reconnect with backoff and resync after every gap.
 
-The server applies idempotent schema migrations during startup unless you disable `database.migrate` in the runtime configuration.
+The synchronization API reports current message records, including edits and tombstones. It is not an event log, and cannot recover every intermediate state. Preserve local deduplication and tolerate repeated updates.
 
-## Check the service
+## Synchronize a save
 
-`/livez` reports whether the process is running. `/readyz` also checks database access and required plugins.
+Read effective `GET /settings/{gameId}` and metadata from `GET /saves/{gameId}`. Compare local and cloud timestamps and apply the chosen conflict policy in the client. Download cloud bytes or upload local bytes after deciding.
 
-```sh
-curl http://localhost:8080/livez
-curl http://localhost:8080/readyz
-```
+The backend stores the settings but does not enforce them during upload. Uploading an older file can overwrite a newer cloud save. There is no conditional-write token or version history. See [Cloud saves](/saves).
 
-For local requests to host-restricted routes, set the appropriate `Host` header or change `http.app_host` and `http.public_host` in your local runtime configuration.
+## Track a play session
 
-## Next steps
+Generate one stable `session.id` at game launch. Periodically send `POST /sync` with the same ID, cumulative session duration, and your cumulative lifetime total for that game. Reconcile your local total with `GET /totals/{gameId}` before sending a later value.
 
-- Read [Configuration](/configuration) before changing runtime settings.
-- Read [Architecture](/architecture) to find the appropriate module for a change.
-- Read [Deployment](/deployment) before pointing a production service at an existing database.
+The backend takes the maximum reported total; it does not add each device's total. See [Playtime](/playtime).
+
+## Before changing a client contract
+
+Verify the endpoint's auth label, wire field casing, response envelope, and non-200 success states. Use the feature's existing identifiers; a Steam app ID, Cobalt game ID, Game Pass product ID, profile username, and user UID are not interchangeable.
+
+For UI-only changes, keep requests unchanged. For a new interaction, use an existing documented route and account for its side effects. Do not silently assume a missing backend capability.

@@ -1,0 +1,64 @@
+---
+title: Playtime
+description: Cumulative totals, stable session IDs, retry behavior, and cross-device reconciliation.
+---
+
+All routes require **user** auth. Paths are rooted at `/sync` and `/totals`; there is no `/playtime` prefix.
+
+## POST /sync
+
+```json
+{
+  "gameId": "game-id",
+  "gameName": "Example game",
+  "totalSeconds": 7200,
+  "lastPlayed": "2026-09-13T12:00:00Z",
+  "session": {
+    "id": "stable-client-session-id",
+    "start": "2026-09-13T11:30:00Z",
+    "duration": 1800
+  }
+}
+```
+
+| Field | Contract |
+| --- | --- |
+| `gameId` | Required string, 1–128 bytes. No catalog lookup required. |
+| `gameName` | String, maximum 1,024 bytes; may be empty. |
+| `totalSeconds` | Cumulative lifetime total, 0–2,147,483,647. Omitted means zero. |
+| `lastPlayed` | RFC3339 timestamp; omitted/empty uses server time. |
+| `session.id` | Stable client session identifier; preferred for retries. |
+| `session.start` | RFC3339 timestamp; optional alternative identity when ID is absent. |
+| `session.duration` | Cumulative duration of this session, same numeric bounds as total. |
+
+Fractional seconds are accepted but truncated to integer storage. Returns `200 {"ok":true,"sessionId":"SERVER_SESSION_ID"}`.
+
+## What the server updates
+
+For a repeated session, the stored session duration only increases. For totals, the server stores the maximum of the submitted and existing `totalSeconds`. It preserves a later existing `lastPlayed` where parseable and replaces `game_name` with the submitted name.
+
+`session_count` increases only for a new session identity. Identity is scoped to user and game, using `session.id` first, otherwise the exact submitted `session.start` string. If neither is supplied, each request creates a new session. Keep the original client identity for retries; the returned server ID is a different derived identifier and must not replace your `session.id` on the next request.
+
+The server does **not** add session duration to the total. For example, submitting `totalSeconds:7200` twice preserves 7200. Submitting `totalSeconds:1800` later cannot reduce it. Two devices independently reporting 7,200 and 1,800 produce a maximum of 7,200, not a sum of 9,000. Reconcile in the client.
+
+## GET /totals
+
+Returns an array directly, sorted by total seconds descending:
+
+```json
+[
+  {
+    "game_id": "game-id",
+    "game_name": "Example game",
+    "total_seconds": 7200,
+    "last_played": "2026-09-13T12:00:00Z",
+    "session_count": 1
+  }
+]
+```
+
+No pagination. An empty account returns `[]`.
+
+## GET /totals/{gameId}
+
+Returns one object with those same snake_case fields, or 404 when no total exists. Treat an initial 404 as “no recorded playtime,” not as a missing catalog game. There is no reset-total or session-list endpoint.

@@ -1,0 +1,112 @@
+---
+title: Discovery
+description: Feed shapes, filtering, recommendations, stored freshness, and Game Pass catalog results.
+---
+
+Use the application origin. Routes are **public** except `/featured` (**optional user**) and `/personalized` (**user**). Default discovery rate limit is 300 requests/minute per client address.
+
+## Discovery game shape
+
+Discovery uses `gameId, name, releaseYear`, not the catalog's `gameName`. Shared metadata includes `slug,publisher,developer,description,platforms,genres,rating`. Optional metadata can be null; `platforms` and `genres` can be JSON-encoded strings because discovery retains stored values.
+
+Enrichment adds `price` and `currentPrice`. When sale strings parse, these become numeric regular/current values. Otherwise stored values can remain strings or null. Do not assume currency, checkout URLs, or multiple store offers: those are not part of this response contract.
+
+The wire mapping renames `expires_at→expiresAt`, `refreshed_at→refreshedAt`, `featured_until→featuredUntil`, `added_at→addedAt`, `starts_at→startsAt`, and `ends_at→endsAt`. It removes `refresh_key` and `updated_at`; other selected fields retain their names.
+
+## GET /featured
+
+No query fields. Returns `{sections:[{id,label,games:DiscoveryGame[]}]}`.
+
+Section order and labels:
+
+| ID | Label |
+| --- | --- |
+| `spotlight` | Spotlight |
+| `editors_choice` | Editor's Choice |
+| `picked_for_you` | Picked for You |
+| `friends_are_playing` | Friends Are Playing |
+| `general` | Discover |
+
+Empty sections are omitted. Stored entries are filtered by expiry, ordered by priority then ID, and limited to 200 before grouping. Blank section values appear in general; unrecognized nonblank sections are not displayed.
+
+Stored featured items additionally contain `id,priority,badge,blurb,section,pinned,expiresAt` and metadata. With user auth, the server appends up to 12 recommendations from recorded playtime and up to 10 games friends are currently playing. Friend-game entries have `friends:[{uid,displayName}]`. Presence must be playing with a game ID and no older than five minutes.
+
+If you attach an expired bearer token, the optional-user route fails authorization; it does not silently return anonymous data.
+
+## Paginated feeds
+
+| Endpoint | Extra input | Ordering |
+| --- | --- | --- |
+| `GET /trending` | None | Rank then game ID. |
+| `GET /new-releases` | None | Release year descending, then game ID. |
+| `GET /on-sale` | `minCut`, integer 0–100, default 20 | Discount descending, then game ID. |
+
+All accept `limit` default 24, range 1–200, and `offset` default 0, range 0–100,000. Return `{count,total,offset,games}`; on-sale adds `minCut`. Count is page size, total is matching stored rows.
+
+Trending rows include `rank,score,velocity,refreshedAt`. New-release rows can include `release_date,is_notable,featuredUntil,addedAt`. Sale rows include `expiresAt,refreshedAt` and:
+
+```text
+sale: {store, price, regular, cut, expiresAt}
+```
+
+Sale `price` and `regular` inside this nested object retain stored text, even when top-level prices are numbers. The read route filters discount, not sale expiry; a stale row can remain until a refresh.
+
+## GET /search
+
+Query `q` is trimmed, maximum 128 bytes. `limit` defaults to 24 (1–200); `offset` defaults to 0 (0–100,000).
+
+Returns `{count,games,offset,query}`. Empty query returns an empty array. Otherwise matches game name case-insensitively and sorts by name then ID. There is no total or hasMore field. SQL LIKE wildcard characters in the query are not escaped as literal text.
+
+Search returns enriched catalog rows, so it can also retain `currentprice` and `metadata_source` alongside the enriched fields. Do not assume the exact same set of optional fields as a stored feed entry.
+
+## GET /game/{identifier}
+
+Resolves exact game ID, then slug, then normalized name/alias. Returns one enriched discovery game directly with `_foundIn:"games"`, or 404. It does not fetch missing metadata from a provider.
+
+## GET /events
+
+Optional `status`: `upcoming, live, ended`. Invalid status is 400. Returns `{count,events:[{id,title,description,icon,status,startsAt,endsAt,url}]}`, at most 200, ordered by start time. Filtering uses the stored status; do not derive a promise of realtime scheduling from the label.
+
+## Collections and spotlight
+
+| Endpoint | Input | Output |
+| --- | --- | --- |
+| `GET /collections` | None | `{count,collections:[{id,slug,title,description,icon}]}`, up to 200 visible collections by ID. |
+| `GET /collections/{slug}` | `limit` default 24/max 200; `offset` default 0/max 100,000 | `{collection,games,count,offset}`; hidden/missing collection is 404. |
+| `GET /genre-spotlight` | None | `{spotlight:null}` or `{spotlight:{id,genre,title,description,icon,startsAt,endsAt}}`. |
+
+Collection games are ordered by `position` then game ID and include `collection_id,position`. Spotlight selects the newest active record, not a time-window calculation.
+
+## POST /personalized
+
+**User.**
+
+```json
+{"games":[{"id":"cobalt-game-id","playtime":7200}],"limit":24}
+```
+
+Supply 1–500 games; playtime cannot be negative. `limit` is a body field, with 1–100 accepted; omitted, nonpositive, or above 100 resets to 24 instead of returning 400. Use seconds consistently with stored playtime. Duplicate input IDs use the last value.
+
+Returns `{count,topGenres:string[],games:DiscoveryGame[]}`. Recommendation rows include `score`. This request computes recommendations; it does not save the supplied library or playtime.
+
+Genre affinity adds `log(1 + playtime) + 1` for each known input game's genres. The server considers the top 1,000 catalog games by rating, excludes supplied IDs, and scores candidates by integer rating/100 plus genre affinity. `topGenres` contains at most five genres. An unknown input ID contributes no genres but remains excluded.
+
+## GET /subscription/xbox-gamepass
+
+Optional `tier` is an exact stored-value filter. Returns:
+
+```text
+{
+  games: [{productId, gameId, title, tier, imageUrl}],
+  count: number,
+  source: "xbox-gamepass"
+}
+```
+
+At most 2,000 entries by title. `gameId` can be null for an unmatched product. Product IDs belong to Microsoft and are distinct from Cobalt IDs. There is no pagination or freshness field in this response.
+
+## Why feeds change without app requests
+
+The discovery job refreshes stored feeds on a configurable interval, default six hours. Trending blends catalog rating/recency with recent session activity across the top 1,000 rated games; it is not a global store chart. New releases use the current release year. Automatic featured refresh preserves pinned entries.
+
+Price refresh separately matches provider deals to known games and retains one matched offer per game. Failed provider refreshes leave existing data readable. Treat the displayed results as cached metadata, not guaranteed live prices or availability.

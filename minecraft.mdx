@@ -1,0 +1,50 @@
+---
+title: Minecraft
+description: Link a Microsoft account, inspect the connection, and request credentials for launching Minecraft.
+---
+
+These routes belong to the auth module. Except for the browser callback, all require **user** auth.
+
+## POST /auth/minecraft/link
+
+Optional JSON `{client:"cobalt"}` or `{client:"uranium"}`. Empty input defaults to `uranium`, so Cobalt callers should explicitly send `cobalt`.
+
+Returns `{authorizationURL:string}`. Note the uppercase `URL`, unlike the browser-auth field `authorizationUrl`.
+
+Open that URL in the browser. The server stores a single-use Microsoft PKCE state for ten minutes; a new link request deletes previous pending states for the user. Missing Microsoft or token-encryption configuration returns 503. Unknown client returns 400.
+
+## GET /auth/minecraft/callback
+
+**Public.** Microsoft supplies `state` and either `code` or `error`. The server consumes the state, verifies Microsoft/Xbox/Minecraft credentials, and saves the linked account.
+
+Returns `302` to the configured launcher URI with `minecraft=linked`, `minecraft=cancelled`, or `minecraft=failed`. Defaults are `cobalt://minecraft-auth` and `uranium://minecraft-auth`. Missing or expired state returns 400 instead of a launcher redirect.
+
+The callback carries no launch token. After `linked`, read the account endpoint.
+
+## GET /auth/minecraft/account
+
+Returns `{"linked":false}` if no account is stored. Otherwise:
+
+```json
+{"linked":true,"id":"minecraft-profile-id","username":"Player","skinURL":"https://example.com/skin.png"}
+```
+
+`skinURL` can be empty. This is a stored profile lookup, not a fresh entitlement/token check.
+
+## POST /auth/minecraft/launch-token
+
+No request body. Returns:
+
+```json
+{
+  "accessToken": "MINECRAFT_ACCESS_TOKEN",
+  "expiresIn": 86400,
+  "profile": {"id":"minecraft-profile-id","username":"Player","skinURL":""}
+}
+```
+
+Expiry above is illustrative; use the returned number of seconds. This token is for Minecraft, not Cobalt requests.
+
+Each call refreshes the linked Microsoft credential, exchanges Xbox/XSTS/Minecraft tokens, and saves rotated credentials and profile details. Response has `Cache-Control:no-store`. Missing link is 404; undecryptable saved credentials give `409 Minecraft account must be linked again`; provider failures can give 502.
+
+The backend stores the Microsoft refresh token encrypted and does not return it. There is no Minecraft unlink endpoint. Relinking replaces the stored account.

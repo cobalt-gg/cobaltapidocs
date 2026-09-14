@@ -1,28 +1,36 @@
 ---
-title: Cobalt backend
-description: Run, configure, and extend the service behind Cobalt.
+title: Cobalt internal API
+description: The backend contract for building and changing Cobalt clients.
 ---
 
-Cobalt Backend is the Go service that powers Cobalt accounts, social features, cloud saves, game catalog data, discovery feeds, and the public game API.
+Use this reference when changing the launcher, Cobalt ID, or another Cobalt client. It explains which requests to send, the exact field names to read, and the behavior your app must handle.
 
-It runs as one HTTP service with PostgreSQL or TessalDB, an identity provider, and optional metadata and object-storage providers. Feature modules can be enabled independently.
+The contracts describe the active Cobalt Backend checkout reviewed on September 13, 2026, at revision `2ebf4c8c6923286ebee5192c9a3fcc1ae37c4a25`. They are implementation-derived, not a claim that every deployment already runs that revision. Cobalt ID was checked as a consumer of these contracts.
 
-<CardGroup cols={2}>
-  <Card title="Run locally" icon="rocket" href="/quickstart">Start a development server with PostgreSQL and Supabase Auth.</Card>
-  <Card title="Use the public API" icon="code" href="/api-overview">Create an API key and query the Cobalt game catalog.</Card>
-  <Card title="Configure the service" icon="sliders" href="/configuration">Set runtime limits, modules, hosts, jobs, and providers.</Card>
-  <Card title="Deploy safely" icon="cloud" href="/deployment">Apply migrations, configure health checks, and roll out safely.</Card>
-</CardGroup>
+## Find the contract for your feature
 
-## What the backend provides
+| App feature | Read |
+| --- | --- |
+| HTTP client, authentication headers, errors, retries | [Request conventions](/architecture) |
+| Sign-in, registration, email verification, passwords, devices | [Authentication and sessions](/authentication) |
+| Discord sign-in, passkeys, desktop/browser handoffs, consent | [Browser authentication](/browser-auth) |
+| Profile editing, showcase games, avatars, share links | [Profiles](/profiles) |
+| Friends, presence, invitations, Discord and itch.io connections | [Social features](/social) |
+| Encrypted DMs, history, synchronization, typing, read receipts | [Messages and realtime](/messages) |
+| Save upload/download and conflict settings | [Cloud saves](/saves) |
+| Tracking gameplay and reconciling device totals | [Playtime](/playtime) |
+| Library metadata, indexing, artwork | [Catalog and artwork](/catalog) |
+| Discover, recommendations, sales, Game Pass | [Discovery](/discovery) |
+| Moderation and catalog editing UI | [Administration](/admin) |
+| Minecraft linking and launch credentials | [Minecraft](/minecraft) |
+| API-key management and the separate versioned catalog API | [Versioned API](/api-overview) |
 
-- Account registration, sign-in, sessions, profiles, password flows, and linked identities.
-- Friends, presence, direct messages, invites, and WebSocket events.
-- Cloud-save storage and per-game save settings.
-- A game catalog, artwork processing, discovery feeds, prices, and Game Pass data.
-- An API-key-protected `/v1` catalog API.
-- Administrative tools and supervised external plugins.
+Start with [Client workflows](/quickstart) for request sequences, [Request conventions](/architecture) for shared rules, or the [complete route index](/route-index) to look up a method and path. Each reference page specifies authentication, input, success output, and relevant failure or retry behavior. Examples use illustrative values; credentials are placeholders.
 
-<Note>
-  The API is designed for Cobalt clients. Treat endpoint behavior and response fields as versioned application contracts, even where a route does not use the `/v1` prefix.
-</Note>
+## Boundaries to preserve
+
+The backend owns identity verification, authorization, persistence, provider credentials, catalog enrichment, and upload storage. Clients own interface state, local files, DM encryption, save conflict decisions, and browser handoff verification.
+
+Do not invent an endpoint because a UI feature needs one. For example, there is no registered password-recovery completion route separate from the password-change route, no Minecraft unlink route, and no HTTP endpoint for removing a passkey. Existing constraints and unavailable flows are called out where they affect app behavior.
+
+This reference covers the built-in application routes. Deployment procedures and external plugin authoring are outside its scope.

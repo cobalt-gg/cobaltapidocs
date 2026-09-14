@@ -1,7 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Cobalt Backend",
+  "name": "Cobalt internal API",
   "colors": {
     "primary": "#5865F2",
     "light": "#7480FF",
@@ -11,25 +11,39 @@
   "navigation": {
     "pages": [
       {
-        "group": "Getting Started",
+        "group": "App integration",
         "pages": [
           "index",
           "quickstart",
-          "architecture"
+          "architecture",
+          "route-index"
         ]
       },
       {
-        "group": "Build with Cobalt",
+        "group": "Accounts",
         "pages": [
+          "authentication",
+          "browser-auth",
+          "profiles"
+        ]
+      },
+      {
+        "group": "Social and player data",
+        "pages": [
+          "social",
+          "messages",
+          "saves",
+          "playtime",
+          "minecraft"
+        ]
+      },
+      {
+        "group": "Games and administration",
+        "pages": [
+          "catalog",
+          "discovery",
+          "admin",
           "api-overview"
-        ]
-      },
-      {
-        "group": "Operate Cobalt",
-        "pages": [
-          "configuration",
-          "deployment",
-          "plugins"
         ]
       }
     ],
@@ -42,10 +56,6 @@
         }
       ]
     }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
   },
   "navbar": {
     "links": [
@@ -71,10 +81,5 @@
       "cursor",
       "vscode"
     ]
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/CobaltLauncher"
-    }
   }
 }

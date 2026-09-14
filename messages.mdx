@@ -1,0 +1,115 @@
+---
+title: Messages and realtime
+description: Encrypted message transport, updates, pagination, synchronization, and WebSocket events.
+---
+
+All HTTP routes here require **user** auth. Message creation, updates, and events share the same message object. The backend stores encrypted payload strings; encryption and decryption belong to the client.
+
+## Message object
+
+```json
+{
+  "id": "message-id",
+  "pairKey": "lexically-first-uid:lexically-second-uid",
+  "senderUid": "sender-id",
+  "receiverUid": "receiver-id",
+  "ciphertext": "CLIENT_ENCRYPTED_TEXT",
+  "iv": "CLIENT_IV",
+  "authTag": "CLIENT_TAG",
+  "replyTo": null,
+  "reactions": {"👍":["user-id"]},
+  "edited": false,
+  "deleted": false,
+  "ts": 1789300800000,
+  "updatedTs": 1789300800000
+}
+```
+
+`ts` and `updatedTs` are Unix milliseconds. `pairKey` joins lexicographically sorted UIDs with a colon. Reactions map emoji strings to arrays of user IDs. Empty reactions are `{}`.
+
+The server only checks encrypted string lengths: `ciphertext` is 1–65,536 bytes; `iv` and `authTag` are each 1–256 bytes. These are transport checks, not validation of a particular cipher or base64 representation.
+
+## POST /social/messages
+
+JSON: `{receiverUid,ciphertext,iv,authTag,replyTo?}`. Receiver must be nonempty; `replyTo` is an optional nullable message ID. Requires friendship. A reply must refer to a message in the same pair.
+
+Returns `200 Message`, not 201, and emits `message` to both users' connected sockets. Every successful send creates a new server-generated ID. There is no caller-supplied idempotency key; do not blindly retry an ambiguous send.
+
+## GET /social/dm/{uid}
+
+Query:
+
+| Parameter | Contract |
+| --- | --- |
+| `limit` | Default 50; 1–100. |
+| `before` | Optional nonnegative Unix-millisecond integer. Strictly older creation times only. |
+
+Returns `{messages:Message[],hasMore:boolean}`. The server selects the newest matching messages, then returns that page oldest-first. History includes edited/deleted records and does not require a currently accepted friendship, only the signed-in participant pair.
+
+For earlier history, use the oldest returned `ts` as `before`. This timestamp-only pagination can skip records sharing the boundary millisecond; it is not a lossless cursor. For full account reconciliation, use the sync endpoint.
+
+## GET /social/dm/sync
+
+Query accepts `cursor` (preferred) or `since` (nonnegative Unix milliseconds). Cursor takes precedence. With neither, starts at the Unix epoch.
+
+Returns:
+
+```text
+{messages: Message[], now: number, hasMore: boolean, nextCursor: string}
+```
+
+At most 500 current records, sorted by update time and then ID. The cursor retains timestamp precision and the tie-breaking ID; treat it as opaque. Apply each page by message ID, persist its cursor, and continue while `hasMore`. With no rows, the cursor stays unchanged. `now` is a legacy watermark, not current wall-clock time.
+
+Updates, reaction changes, and deleted tombstones are included. This is not a durable change-event stream: multiple edits can collapse into the latest record, and mutations during paging can cause duplicates. Reconcile after reconnect and retain deduplication.
+
+## Message mutations
+
+| Endpoint | Input | Behavior |
+| --- | --- | --- |
+| `PATCH /social/messages/{id}` | `{ciphertext,iv,authTag}` | Sender only; cannot edit a deleted message. Replaces encrypted content and sets `edited:true`. |
+| `DELETE /social/messages/{id}` | No body | Sender only. Sets `deleted:true`, clears ciphertext/IV/tag and reactions. Keeps a tombstone. |
+| `POST /social/messages/{id}/react` | `{emoji:string}`, 1–64 bytes | Either participant; toggles caller's membership for that emoji. Deleted messages reject reactions. |
+
+All return the updated Message and emit `message_update` to both users. A caller outside the pair gets 403. A receiver attempting sender-only operations gets `404 NOT_FOUND`. A new emoji is rejected if there are already 64 distinct reactions. Retrying a toggle can undo the original reaction.
+
+## POST /social/dm/{uid}/read
+
+No body. Records the current read time for this pair and returns `{success:true}`. Pushes `{type:"read",from:callerUid,pairKey,ts}` to the other user. It does not accept a specific message ID or enforce current friendship. The documented HTTP surface has no read-receipt history query.
+
+## GET /social/ws
+
+Upgrade to a WebSocket using a bearer header or, for browser WebSocket clients, `?token=ID_TOKEN`. Authentication happens when connecting. Use TLS in production and keep token-bearing URLs out of client logs.
+
+```javascript
+const socket = new WebSocket(
+  "wss://app-api.cobaltlauncher.com/social/ws?token=" +
+  encodeURIComponent(session.idToken)
+);
+socket.onmessage = ({ data }) => {
+  const event = JSON.parse(data);
+  if (event.type === "message" || event.type === "message_update") {
+    upsertMessage(event.msg);
+  }
+};
+```
+
+The server accepts an absent Origin or a configured browser origin. Each user can hold at most eight connections. Before upgrade, exhausted capacity returns `503 connection limit reached`; a race after upgrade may close the socket.
+
+### Client-to-server messages
+
+Only `{"type":"typing","to":"OTHER_UID"}` and `{"type":"typing_stop","to":"OTHER_UID"}` are handled. Recipient is a nonempty string of at most 128 bytes and must be a friend. Signals faster than one per 200 ms per connection are ignored. Invalid/unsupported messages are ignored; payloads above 8,192 bytes close the read.
+
+Use HTTP to create, edit, delete, react to, or mark messages read.
+
+### Server-to-client messages
+
+| Type | Fields | Recipients |
+| --- | --- | --- |
+| `message` | `msg: Message` | All sockets for sender and receiver. |
+| `message_update` | `msg: Message` | All sockets for sender and receiver. |
+| `typing`, `typing_stop` | `from, pairKey` | Recipient's sockets. |
+| `read` | `from, pairKey, ts` | Other participant's sockets. |
+
+No initial snapshot or delivery acknowledgement is emitted. No presence, friend-request, or game-invite events are emitted by the current handlers.
+
+The server sends WebSocket control pings every 25 seconds and requires pongs within its 60-second read deadline. Browsers handle these automatically; native clients must support them. Each connection buffers 64 outgoing events; slow consumers are disconnected. Reconnect with backoff and synchronize over HTTP after any disconnection.

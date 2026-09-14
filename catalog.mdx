@@ -1,0 +1,123 @@
+---
+title: Catalog and artwork
+description: Internal game records, lookup and indexing, bulk resolution, updates, and asynchronous artwork.
+---
+
+Catalog routes here are **public** except the separately documented [Game Pass sync](/admin). They share the catalog rate limit, default 600 requests/minute per client address.
+
+## Game object
+
+```json
+{
+  "gameId": "cobalt-game-id",
+  "gameName": "Example game",
+  "slug": "example-game",
+  "releaseYear": 2026,
+  "publisher": "Publisher",
+  "developer": "Developer",
+  "description": "Game description",
+  "platforms": ["PC"],
+  "genres": ["Adventure"],
+  "rating": 85,
+  "price": null,
+  "currentPrice": null,
+  "source": "igdb"
+}
+```
+
+Metadata can be null. `platforms` and `genres` are always arrays here. `price` and `currentPrice` are stored text values, not guaranteed JSON numbers. The versioned API and discovery use different shapes.
+
+Treat `gameId` as an opaque Cobalt identifier. Newly indexed IDs are 12 hex characters derived from normalized game names; existing IDs need not be regenerated. Store IDs returned by the API rather than constructing your own from platform IDs or names.
+
+## GET /games/{name}
+
+Lookup tries exact game ID, then exact slug, then a normalized name/alias lookup. Normalization lowercases the string, turns runs of non-ASCII-alphanumeric characters into underscores, and trims outer underscores.
+
+Returns one Game or 404. Encode names as path segments. The static paths `/games/list` and `/games/updates` are reserved routes.
+
+## GET /games/list
+
+Query `limit`: default 50, 1–200. `offset`: default 0, 0–100,000. Returns `{games:Game[],count:number}`, ordered by game name then ID. Count is this page's length, not total catalog size. There is no `hasMore` field.
+
+## GET /games/updates
+
+Query `since`: RFC3339 timestamp, default epoch; `limit`: default 1,000, maximum 5,000; `offset`: default 0, maximum 100,000.
+
+Returns `{updates:[{gameId,updatedAt}],hasMore,nextOffset}`, ordered by update timestamp then ID. Only records strictly newer than `since` are included. Keep the same `since` while following `nextOffset`, and fetch the returned IDs through bulk lookup.
+
+This is offset pagination of current records, not a snapshot or deletion log. Concurrent changes can shift pages. Retain deduplication and periodically reconcile the full list if completeness matters.
+
+## POST /games/bulk
+
+JSON: `{ids?:string[],names?:string[]}`, with 1–100 entries combined. Both arrays may be supplied.
+
+Returns `{games:Game[],missing:string[],count:number}`. IDs are processed before names; duplicate matches are returned only once by canonical game ID. Missing inputs remain in `missing`. Do not zip response positions to request positions.
+
+## POST /games
+
+JSON: `{name:string}`; `gameName` is a fallback when `name` is empty. A nonblank name of at most 512 bytes is required.
+
+If already known, returns `200 Game`. Otherwise it searches the configured catalog provider, stores the game and lookup aliases, queues artwork when storage exists, and returns `201 Game`. No provider gives 503; no match gives 404. This request can perform a synchronous provider lookup; do not treat it as a pure cache read.
+
+## Artwork types and sizes
+
+| Type | Intended use |
+| --- | --- |
+| `portrait` | Portrait cover. |
+| `landscape` | Landscape cover/card. |
+| `hero` | Wide background/header. |
+| `logo` | Game wordmark. |
+| `icon` | Small game icon. |
+
+Sizes: `small` (320-pixel target width), `medium` (640, default), `large` (1280), and `max` (no requested resize). All prepared variants use WebP. Not every game has every artwork type.
+
+## GET /art/{gameId}/{type}
+
+Optional `size` query. Requires a game ID, not a name or slug.
+
+| Status | Response |
+| --- | --- |
+| 200 | Raw `image/webp` bytes; cache header `public, max-age=86400`. |
+| 202 | `{status:"queued",url:string}`, with `Retry-After: 5`. The URL is a future CDN location. |
+| 400 | Invalid artwork type, size, or ID syntax. |
+| 404 | Unknown game, or requested artwork unavailable after preparation finished. |
+| 502 | Object storage could not be read. |
+| 503 | Storage or needed metadata provider is unconfigured. |
+
+A `202` is JSON, not an image. Use a placeholder and retry later; do not feed the JSON body into an image decoder. A returned URL does not prove the object is ready.
+
+## POST /art/bulk
+
+Either specify individual requests:
+
+```json
+{"images":[{"gameId":"game-id","type":"portrait","size":"small"}]}
+```
+
+or expand game IDs across types:
+
+```json
+{"gameIds":["game-id"],"types":["portrait","hero"],"size":"medium"}
+```
+
+You may combine both. Empty/missing `types` expands to all five types. Missing size uses medium. Combined image count must be 1–500.
+
+Returns `200 {images:ArtResult[],count:number}`. An ArtResult has `gameId,type,status` and, where applicable, `url,error`. Size is not echoed; retain your requested size.
+
+| Per-item status | Meaning |
+| --- | --- |
+| `cached` | Manifest says the variant exists; use its URL. |
+| `queued` | Preparation requested; poll with backoff. |
+| `missing` | Unknown game or unavailable artwork after a finished batch. |
+| `error` | Invalid type/size or unavailable provider. |
+| `duplicate` | Same valid object key occurred earlier in this request. |
+
+Results follow input expansion order: explicit images first, then each game ID crossed with its types. Bulk status is independent of HTTP status. Invalid individual items normally appear as item errors inside a successful response.
+
+The bulk endpoint checks the manifest, whereas direct image GET reads object storage. A cached manifest and a temporarily missing object can disagree. Keep fallback rendering even for cached results.
+
+## Background effects relevant to clients
+
+New catalog data can arrive through indexing jobs without a client write. Artwork processing prepares variants asynchronously, retries failures with backoff, and can finish with only some types. Default intervals are 15 seconds for indexing and 5 seconds for artwork, measured after each run; these are not completion-time guarantees.
+
+Manual artwork changes reuse the same variant URLs, so browser/CDN caches can show an older image. Do not assume a metadata refresh invalidates image caching automatically.

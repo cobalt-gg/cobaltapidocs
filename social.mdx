@@ -1,0 +1,111 @@
+---
+title: Social features
+description: Friends, presence, public keys, consumed invitations, and connected accounts.
+---
+
+All routes require **user** auth except `GET /lobby/invite/{id}`. Success is `200` unless specified. All JSON field names below are the actual wire names.
+
+## Friends
+
+| Endpoint | Input | Response |
+| --- | --- | --- |
+| `GET /social/friends` | None | `{friends: Friend[]}`, up to 1,000 accepted friendships ordered by relation creation. |
+| `POST /social/friends/request` | `{username: string}` | `{success:true,targetUsername,targetDisplayName}` |
+| `POST /social/friends/accept` | `{uid: string}` of the requester | `{success:true}` |
+| `GET /social/friends/pending` | None | `{incoming: PendingFriend[],outgoing: PendingFriend[]}` |
+| `DELETE /social/friends/{uid}` | Other user's UID | `{success:true}` |
+
+A `Friend` has `uid, displayName, username, avatarUrl, discordId, discordUsername, presence, game, game_id, vr, steam_app_id, steam_lobby, steam_host_id, publicKey`. `presence` here is a status string, not an object. Game and connected-account fields can be null; `vr` is boolean.
+
+A `PendingFriend` has `uid, displayName, username, avatarUrl, created_at`. The pending endpoint reads at most 1,000 relations total, newest first, then separates incoming and outgoing.
+
+Friend requests normalize username by trimming and lowercasing. Adding yourself returns `400 CANNOT_ADD_SELF`; an accepted relation returns `409 ALREADY_FRIENDS`; a pending relation in either direction returns `409 REQUEST_PENDING`; another existing status returns `403 BLOCKED`. There is no route here for creating a block.
+
+Accept only succeeds for an incoming pending request; otherwise `404 REQUEST_NOT_FOUND`. Delete removes the relation in either direction and is also how you cancel or reject a pending request. Deleting an absent relation succeeds.
+
+Friend actions do not emit WebSocket events in this implementation. Refetch lists after a change.
+
+## GET /social/search
+
+Query `q` is trimmed. Fewer than two bytes returns `{users:[]}`; more than 100 returns 400. Otherwise searches username or display name case-insensitively, excludes yourself and banned users, sorts by username, and returns at most 20.
+
+```json
+{"users":[{"uid":"user-id","display_name":"Player","username":"player","avatar_url":null}]}
+```
+
+Search uses snake_case profile fields, unlike friend records.
+
+## PUT /social/presence
+
+Replaces stored presence; omitted optional values become null/false. Input:
+
+```json
+{
+  "status": "playing",
+  "game": "Example game",
+  "game_id": "cobalt-game-id",
+  "vr": false,
+  "steam_app_id": "123",
+  "steam_lobby": null,
+  "steam_host_id": null
+}
+```
+
+`status` defaults to `online` and accepts `online, playing, offline, idle`. Game/Steam fields are optional nullable strings. Returns `{success:true}`.
+
+When status is `playing` and `game` is non-null, this also prepends a recent-game entry `{id,name,coverUrl:null}`, deduplicates by ID, and keeps up to three entries. It uses `game_id` when supplied, otherwise the game name as ID.
+
+Presence writes do not broadcast a WebSocket event. Socket disconnect does not mark a user offline. Friend/profile reads return stored presence without freshness expiry; the “friends are playing” discovery section separately ignores presence older than five minutes.
+
+## Encryption public keys
+
+| Endpoint | Input | Response |
+| --- | --- | --- |
+| `POST /social/keys` | `{publicKey:string}`, 1–16,384 bytes | `{success:true}` |
+| `GET /social/keys/{uid}` | User UID | `{uid,publicKey}`; excludes banned users. |
+
+The key is an opaque string. The backend does not validate an encryption algorithm or key encoding, perform a key exchange, or manage historical private keys. Publishing replaces the stored public key. Fetching a key does not require friendship. Preserve the app's encryption protocol when changing DM code.
+
+## Game invites
+
+### POST /social/invite
+
+JSON: `{to_uid:string, app_id:string, lobby?:string|null, host_id?:string|null, game?:string|null}`. Target and app ID must be nonempty. Requires accepted friendship; otherwise 403. Returns `{success:true}` and creates a new invite each time.
+
+### GET /social/invites
+
+Returns `{invites:[{id,from_uid,app_id,lobby,host_id,game,from_name}]}`, at most 100 oldest-first.
+
+**Reading consumes the returned invitations.** They are deleted in the same transaction as the read. Disable speculative prefetch and automatic repeated GETs. A lost response can lose invitations; there is no separate acknowledgement endpoint.
+
+## Shareable lobby invites
+
+### POST /lobby/invite
+
+**User.** JSON:
+
+```json
+{"cobalt_id":"cobalt-game-id","steam_id":"123","lobby_id":"456","players":["player"]}
+```
+
+All three strings are required; `players` must contain 1–256 strings. Returns `201 {id,expires_at}`. Expiry is 24 hours from creation.
+
+### GET /lobby/invite/{id}
+
+**Public.** Returns `{id,cobalt_id,steam_id,lobby_id,players,created_at,expires_at}` for an unexpired invite, otherwise 404. `players` is the stored database value; consumers should tolerate a JSON-encoded array as well as an array. Reading does not consume this kind of invite.
+
+## Discord profile connection
+
+`POST /social/discord/oauth` and `POST /social/discord/link` are aliases. Both require **user** auth and JSON `{code:string, redirectUri?:string}`. Use a real Discord OAuth authorization code. The default redirect URI is `http://127.0.0.1:42070/discord-auth`; browser callers supply the URI used in their OAuth request.
+
+The server exchanges the code, verifies the Discord user, and stores the connection. Returns the full [Profile](/profiles) plus `discordVerified:true`. Missing code is 400; missing provider configuration is 503; identity already connected elsewhere is 409. A claimed Discord ID cannot substitute for an OAuth code.
+
+`DELETE /social/discord/unlink` clears Discord ID, username, and avatar and returns `{success:true}`. This clears Cobalt's profile connection; it does not revoke provider OAuth grants or remove an identity from Supabase.
+
+## itch.io profile connection
+
+`POST /social/itch/link`: **user** auth; JSON `{accessToken:string}`. Token is trimmed and must contain 1–512 bytes. The backend checks it with itch.io, records `itchId, itchUsername, itchUrl`, and returns the full Profile. A connection owned elsewhere returns 409; rejected token returns 401; upstream failures return 502.
+
+`DELETE /social/itch/unlink`: clears those fields and returns `{success:true}`.
+
+itch.io uses an implicit OAuth flow. The token is used to verify the connection and is not stored by this handler. There is no itch.io sign-in endpoint: an itch token is not a Cobalt session credential. The stale sign-in comment in the ID client's API wrapper does not describe a registered backend capability.
